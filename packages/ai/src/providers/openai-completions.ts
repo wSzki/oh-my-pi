@@ -557,20 +557,39 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				}
 
 				if (choice.delta) {
-					if (
-						choice.delta.content !== null &&
-						choice.delta.content !== undefined &&
-						choice.delta.content.length > 0
-					) {
+					const rawContent = choice.delta.content;
+
+					// Inline dispatch for text deltas — routes through MiniMax/Deepseek buffers
+					// or appends directly, depending on compat flags.
+					const dispatchText = (text: string) => {
 						if (!firstTokenTime) firstTokenTime = Date.now();
 						if (parseMiniMaxThinkTags) {
-							taggedTextBuffer += choice.delta.content;
+							taggedTextBuffer += text;
 							flushTaggedTextBuffer();
 						} else if (stripDeepseekChatTemplateTokens) {
-							deepseekStripBuffer += choice.delta.content;
+							deepseekStripBuffer += text;
 							flushDeepseekStripBuffer(false);
 						} else {
-							appendTextDelta(choice.delta.content);
+							appendTextDelta(text);
+						}
+					};
+
+					if (typeof rawContent === "string") {
+						if (rawContent.length > 0) dispatchText(rawContent);
+					} else if (Array.isArray(rawContent)) {
+						// Mistral reasoning models return structured content parts:
+						// [{type:"thinking",thinking:[{type:"text",text:"..."}]}] or [{type:"text",text:"..."}]
+						for (const part of rawContent) {
+							if (part?.type === "text" && part.text) {
+								dispatchText(part.text);
+							} else if (part?.type === "thinking" && Array.isArray(part.thinking)) {
+								for (const tp of part.thinking) {
+									if (tp?.text) {
+										if (!firstTokenTime) firstTokenTime = Date.now();
+										appendThinkingDelta(tp.text, "reasoning_content");
+									}
+								}
+							}
 						}
 					}
 
@@ -1194,11 +1213,13 @@ export function convertMessages(
 			const nonEmptyThinkingBlocks = thinkingBlocks.filter(b => b.thinking && b.thinking.trim().length > 0);
 			if (nonEmptyThinkingBlocks.length > 0) {
 				if (compat.requiresThinkingAsText) {
-					// Convert thinking blocks to plain text (no tags to avoid model mimicking them)
+					// Convert thinking blocks to plain text (no tags to avoid model mimicking them).
+					// Mistral rejects the reasoning_content field (422), so thinking must be
+					// embedded as text content, not as a top-level reasoning field.
 					const thinkingText = nonEmptyThinkingBlocks.map(b => b.thinking).join("\n\n");
-					const textContent = assistantMsg.content as Array<{ type: "text"; text: string }> | null;
-					if (textContent) {
-						textContent.unshift({ type: "text", text: thinkingText });
+					if (typeof assistantMsg.content === "string") {
+						// Text blocks were already joined into a string — prepend thinking.
+						assistantMsg.content = thinkingText + "\n\n" + assistantMsg.content;
 					} else {
 						assistantMsg.content = [{ type: "text", text: thinkingText }];
 					}
@@ -1214,7 +1235,7 @@ export function convertMessages(
 				}
 			}
 
-			if (compat.thinkingFormat === "openai") {
+			if (compat.thinkingFormat === "openai" && !compat.requiresThinkingAsText) {
 				const streamedReasoningField = nonEmptyThinkingBlocks[0]?.thinkingSignature;
 				const reasoningField =
 					streamedReasoningField === "reasoning_content" ||
